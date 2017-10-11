@@ -8,6 +8,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.SortedSet;
+import java.util.TreeSet;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -41,13 +43,13 @@ import org.json.XML;
  *   that is generated.
  */
 public class JsonHiveSchema  {
-	static final String RESPONSE_ROOT = "Response";
-	static final String KEYED_RESPONSE_ROOT = "KeyedResponse";
-	static final String[] KEYED_RESPONSE_DATA = {"TPSSourceRecord","ApplicationData","keyData"};
 	static final String XPATH_SERDE = "column.xpath.";
 	static final String JSON_SERDE = "ROW FORMAT SERDE 'org.apache.hive.hcatalog.data.JsonSerDe';";
 	static final String XML_SERDE = "ROW FORMAT SERDE 'com.ibm.spss.hive.serde2.xml.XmlSerDe'";
-	static boolean skipKeyedResponse;
+	static String KEYED_RESPONSE_ROOT = "KeyedResponse";
+	static String RESPONSE_ROOT = "Response";
+	static String[] METADATA_RESPONSE_TAGS = {""}; // {"TPSSourceRecord","ApplicationData","keyData"};
+	static boolean ALL_TYPES_STRING = false;
 	
 	static void help(Options options) {
 	  HelpFormatter formatter = new HelpFormatter();
@@ -70,7 +72,10 @@ public class JsonHiveSchema  {
 		options.addOption("tableName",true,"Tablename for the hive schema. Defaults to 'hive_table'.");
 		options.addOption("input",true,"File to build schema from.");
 		options.addOption("output",true,"File to output schema to.");
-		options.addOption("skipKeyedResponse", false, "Skips the inclusion of the KeyedResponse tags in the XML. Defaults to false.");
+		options.addOption("allTypesString",false,"This flag makes all table types strings instead of the detected scalar type.");
+		options.addOption("rootTag",true,"Root tag in XML documents to parse. Default is '<KeyedResponse> and this option is ignored for JSON.");
+		options.addOption("responseTag",true,"Response tag within the Root tag for XML to parse for table structures. Default is '<Response>' and this option is ignored for JSON.");
+		options.addOption("metadataTags",true,"Tags not within the ResponseTag used for metadata. No default and not used for JSON.");
 		options.addOption("typePaths", true, "Paths to define independent primitive & complex types. Defaults to the root Response object.");
 
     	CommandLineParser parser = new DefaultParser();
@@ -92,7 +97,10 @@ public class JsonHiveSchema  {
     	String outputFile = cmd.getOptionValue("output");
     	String tableName = (cmd.hasOption("tableName") ? cmd.getOptionValue("tableName") : "hive_table");
     	boolean convertXML = (cmd.hasOption("inputType") ? (cmd.getOptionValue("inputType").equalsIgnoreCase("XML") ? true : false) : false);
-    	skipKeyedResponse = (cmd.hasOption("skipKeyedResponse") ? true : false);
+    	ALL_TYPES_STRING = (cmd.hasOption("allTypesString") ? true : false);
+    	KEYED_RESPONSE_ROOT = (cmd.hasOption("rootTag") ? cmd.getOptionValue("rootTag") : "KeyedResponse");
+    	RESPONSE_ROOT = (cmd.hasOption("responseTag") ? cmd.getOptionValue("responseTag") : "Response");
+    	String metadataTagsOption = (cmd.hasOption("metadataTags") ? cmd.getOptionValue("metadataTags") : "");
     	String typePaths = (cmd.hasOption("typePaths") ? cmd.getOptionValue("typePaths").toString() : "Response");
     	String fileText = "";
     	String jsonText = "";
@@ -104,10 +112,17 @@ public class JsonHiveSchema  {
         if(typePaths.contains(",")){
         	primaryHiveTypes = Arrays.asList(typePaths.split(","));
         }
-        else{
+        else {
         	primaryHiveTypes = Arrays.asList(typePaths);
         }
         
+        if(metadataTagsOption.contains(",")){
+        	METADATA_RESPONSE_TAGS = metadataTagsOption.split(",");
+        }
+        else {
+        	METADATA_RESPONSE_TAGS = new String[] {metadataTagsOption};
+        }
+               
     	// Read in the input file
         StringBuilder sb = new StringBuilder();
         BufferedReader br = new BufferedReader( new FileReader(inputFile) );
@@ -126,33 +141,26 @@ public class JsonHiveSchema  {
 
         if(convertXML) {
         	schemaWriter.serdeType = "XML";
-        	
+
         	// Convert the XML to a JSON Object
         	initialObj = XML.toJSONObject(fileText);
 
         	// Add the Keyed Data to the new object
-        	if(!skipKeyedResponse) {
-	        	for(String item : Arrays.asList(KEYED_RESPONSE_DATA)){
-	            	schemaWriter._xPaths.add(formatXPath(item, item.replace("/", "_"), HIVE_TYPE.struct));        		
-	        	}       	
-        	}
+        	for(String item : Arrays.asList(METADATA_RESPONSE_TAGS)){
+        		if(item != "") 
+        			schemaWriter._xPaths.add(formatXPath(item, item.replace("/", "_"), HIVE_TYPE.struct));        		
+        	}       	
         }
         else
         {
     		initialObj = new JSONObject(fileText);
         }
 
-        if(!skipKeyedResponse) {
-	       	// Take the known parts of the Key Data and create a new object that will be the final output
-	    	finalObj = new JSONObject(initialObj.getJSONObject(KEYED_RESPONSE_ROOT), KEYED_RESPONSE_DATA );
-	
-	    	// Get the root response object, list of all keys, then determine if we iterate for certain sub-keys or type the whole response.
-	    	respRoot = initialObj.getJSONObject(KEYED_RESPONSE_ROOT).getJSONObject(RESPONSE_ROOT);
-        }
-        else {
-        	finalObj = new JSONObject(initialObj);
-        	respRoot = initialObj.getJSONObject(RESPONSE_ROOT);
-        }
+       	// Take the known parts of the Key Data and create a new object that will be the final output
+    	finalObj = new JSONObject(initialObj.getJSONObject(KEYED_RESPONSE_ROOT), METADATA_RESPONSE_TAGS );
+
+    	// Get the root response object, list of all keys, then determine if we iterate for certain sub-keys or type the whole response.
+    	respRoot = initialObj.getJSONObject(KEYED_RESPONSE_ROOT).getJSONObject(RESPONSE_ROOT);
 
         // Testing method for all keys
     	ArrayList<String> keys = schemaWriter.getKeys(respRoot);
@@ -198,7 +206,8 @@ public class JsonHiveSchema  {
 				else {
 					queryPath = type;
 					o = respRoot.query((!queryPath.startsWith("/")? "/" + queryPath : queryPath));
-					finalObj.put(queryPath.replace("/", "_"),o);
+					String queryPathName = (queryPath.endsWith("/") ? queryPath.substring(0, queryPath.lastIndexOf("/")).replace("/", "_") : queryPath.replace("/", "_"));
+					finalObj.put(queryPathName,o);
 					if(convertXML){
 						HIVE_TYPE hiveType;
 						if(o instanceof JSONObject) {
@@ -210,7 +219,7 @@ public class JsonHiveSchema  {
 						else {
 							hiveType = HIVE_TYPE.primitive;
 						}
-						schemaWriter._xPaths.add(formatXPath(RESPONSE_ROOT + "/" + queryPath, queryPath.replace("/", "_"), hiveType));
+						schemaWriter._xPaths.add(formatXPath(RESPONSE_ROOT + "/" + queryPath, queryPathName, hiveType));
 					}
 				}
     		}
@@ -275,7 +284,7 @@ public class JsonHiveSchema  {
 		StringBuilder column = new StringBuilder();
 		String k = keys.next();
 		column.append("\t,");
-		column.append((_reservedKeywords.contains(k.toUpperCase()) ? "`" + k.replace(":", "_").toLowerCase() + "`" : k.replace(":", "_").toLowerCase()));
+		column.append((_reservedKeywords.contains(k.toUpperCase()) ? "`" + k.replace(":", "_").replace("-", "").replace(".","").toLowerCase() + "`" : k.replace(":", "_").replace("-", "").replace(".","").toLowerCase()));
 		column.append(' ');
 		column.append(valueToHiveSchema(jo.opt(k), k));
 		column.append("\n");
@@ -318,12 +327,12 @@ public class JsonHiveSchema  {
     while (keys.hasNext()) {
       String k = keys.next(); 
       String fieldName = (k.equals("content") ? parent : k);
-      sb.append((_reservedKeywords.contains(fieldName.toUpperCase()) ? "`" + fieldName.replace(":", "_") + "`" : fieldName.replace(":", "_")));
+      sb.append((_reservedKeywords.contains(fieldName.toUpperCase()) ? "`" + fieldName.replace(":", "_").replace("-", "").replace(".","") + "`" : fieldName.replace(":", "_").replace("-", "").replace(".","")));
       sb.append(':');
       sb.append(valueToHiveSchema(o.opt(k), k));
-      sb.append(", ");
+      sb.append(",");
     }
-    sb.replace(sb.length() - 2, sb.length(), ">"); // remove last comma
+    sb.replace(sb.length() - 1, sb.length(), ">"); // remove last comma
     return sb.toString();
   }
   
@@ -331,59 +340,24 @@ public class JsonHiveSchema  {
 	    return "array<" + arrayJoin(a, ",", parent) + '>';
   }
  
-  private String arrayJoin(JSONArray a, String separator, String parent) throws JSONException {
-	    StringBuilder sb = new StringBuilder();
-
-	    if (a.length() == 0) {
-	      throw new IllegalStateException("Array is empty: " + a.toString());
-	    }
-	      
-	    Object entry0 = a.get(0);
-	    if ( isScalar(entry0) ) {
-	      sb.append(scalarType(entry0));
-	    } else if (entry0 instanceof JSONObject) {
-	      sb.append(toHiveSchema((JSONObject)entry0, parent));
-	    } else if (entry0 instanceof JSONArray) {    
-	      sb.append(toHiveSchema((JSONArray)entry0, parent));
-	    }
-	    return sb.toString();
-  }
-  
   private String toHiveQuery(JSONObject o, String keyName) throws JSONException { 
 	    Iterator<String> keys = o.keys();
 	    StringBuilder sb = new StringBuilder();
 	    
 	    while (keys.hasNext()) {
 	      String k = keys.next();
-	      sb.append("\t,").append(keyName.toLowerCase()).append(".").append(k.toString().toLowerCase()); // first part
-	      sb.append(" AS ").append(keyName.toLowerCase()).append("_").append(k.toLowerCase()).append("\n"); // AS part
-	    }
-	    
+		  if (isScalar(o.opt(k))) {
+		      sb.append("\t,").append(keyName.toLowerCase()).append(".").append(k.toString().toLowerCase()); // first part
+		      sb.append(" AS ").append((keyName.contains(".") ? keyName.replace('.', '_').toLowerCase() : keyName.toLowerCase() )).append("_").append(k.toLowerCase()).append("\n"); // AS part
+		  } else if (o.opt(k) instanceof JSONObject) {
+			  sb.append(toHiveQuery((JSONObject)o.opt(k),keyName + "." + k));
+		  } else if (o.opt(k) instanceof JSONArray) {
+		      sb.append("\t,").append(keyName.toLowerCase()).append(".").append(k.toString().toLowerCase()); // first part
+		      sb.append(" AS ").append((keyName.contains(".") ? keyName.replace('.', '_').toLowerCase() : keyName.toLowerCase() )).append("_").append(k.toLowerCase()).append("\n"); // AS part
+		  }  
+	    }    
 	    return sb.toString();
 	  }
-  
-  private String scalarType(Object o) {
-    if (o instanceof String) return "string";
-    if (o instanceof Number) return scalarNumericType(o);
-    if (o instanceof Boolean) return "boolean";
-    return "string";
-  }
-
-  private String scalarNumericType(Object o) {
-    String s = o.toString();
-    if (s.indexOf('.') > 0) {
-      return "double";
-    } else {
-      return "int";
-    }
-  }
-
-  private boolean isScalar(Object o) {
-    return o instanceof String ||
-        o instanceof Number ||
-        o instanceof Boolean || 
-        o == JSONObject.NULL;
-  }
 
   private String valueToHiveSchema(Object o, String parent) throws JSONException {
     if ( isScalar(o) ) {
@@ -434,7 +408,8 @@ public class JsonHiveSchema  {
 	  return keys;
   }
   
-  private ArrayList<String> getArrayValueTypes(Object o)
+  @SuppressWarnings("unused")
+private ArrayList<String> getArrayValueTypes(Object o)
   {  
 	  ArrayList<String> valueTypes = new ArrayList<String>();
 	  if(o instanceof JSONArray) {
@@ -467,6 +442,47 @@ public class JsonHiveSchema  {
 	  return valueTypes;
   }
   
+  private String arrayJoin(JSONArray a, String separator, String parent) throws JSONException {
+	    StringBuilder sb = new StringBuilder();
+  	
+	    if (a.length() == 0) {
+	      throw new IllegalStateException("Array is empty: " + a.toString());
+	    }
+	    Object entry0 = a.get(0);
+	    if ( isScalar(entry0) ) {
+	      sb.append(scalarType(entry0));
+	    } else if (entry0 instanceof JSONObject) {
+	      sb.append(toHiveSchema((JSONObject)entry0, parent));
+	    } else if (entry0 instanceof JSONArray) {    
+	      sb.append(toHiveSchema((JSONArray)entry0, parent));
+	    }
+      return sb.toString();
+}
+  
+  private String scalarType(Object o) {
+	if (ALL_TYPES_STRING) return "string";
+	if (o instanceof String) return "string";
+	if (o instanceof Number) return scalarNumericType(o);
+	if (o instanceof Boolean) return "boolean";
+	return "string";
+  }
+
+  private String scalarNumericType(Object o) {
+    String s = o.toString();
+    if (s.indexOf('.') > 0) {
+      return "double";
+    } else {
+      return "int";
+    }
+  }
+
+  private boolean isScalar(Object o) {
+    return o instanceof String ||
+        o instanceof Number ||
+        o instanceof Boolean || 
+        o == JSONObject.NULL;
+  }
+
   private String formatHiveTable(String tableName, String columnDDL){
 	  StringBuilder sb = new StringBuilder("CREATE EXTERNAL TABLE ").append(tableName).append(" (\n").append(columnDDL).append(")\n");
 	  sb.append("COMMENT 'Auto Generated Schema, Put Table description here'\n");
@@ -477,7 +493,7 @@ public class JsonHiveSchema  {
 			  sb.append("\t,").append(xpath).append("\n");
 		  }
 		  // Append the rest of the table info
-		  String xmlRoot = (skipKeyedResponse ? RESPONSE_ROOT : KEYED_RESPONSE_ROOT);
+		  String xmlRoot = KEYED_RESPONSE_ROOT;
           sb.append(")\nSTORED AS\n").append("INPUTFORMAT 'com.ibm.spss.hive.serde2.xml.XmlInputFormat'\n")
               .append("OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'\n")
               .append("TBLPROPERTIES (\n").append("\t\"xmlinput.start\"=\"<" + xmlRoot + "\",").append("\n")
@@ -490,7 +506,7 @@ public class JsonHiveSchema  {
   }
   
   private static String formatXPath(String path,String name,HIVE_TYPE type){
-	  String xpath = (skipKeyedResponse ? "/" : KEYED_RESPONSE_ROOT) + path;
+	  String xpath = "/" + KEYED_RESPONSE_ROOT + "/" + path;
 	  switch(type){
 	  	case primitive:
 	  		return String.format("\"%1$s%2$s\"=\"%3$s%4$s\"",XPATH_SERDE,name.toLowerCase(),xpath,"/text()");
@@ -504,4 +520,29 @@ public class JsonHiveSchema  {
 			return null;
 	  }	  
   }
+  
+  static class OrderedIterator implements Iterator<String> {
+
+	    Iterator<String> it;
+	    
+	    public OrderedIterator(Iterator<String> iter) {
+	      SortedSet<String> keys = new TreeSet<String>();
+	      while (iter.hasNext()) {
+	        keys.add(iter.next());
+	      }
+	      it = keys.iterator();
+	    }
+	    
+	    public boolean hasNext() {
+	      return it.hasNext();
+	    }
+
+	    public String next() {
+	      return it.next();
+	    }
+
+	    public void remove() {
+	      it.remove();
+	    }
+	  }
 }
